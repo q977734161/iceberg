@@ -37,7 +37,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.IMetaStoreClient;
 import org.apache.hadoop.hive.metastore.TableType;
-import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
+import org.apache.hadoop.hive.metastore.api.InvalidObjectException;
 import org.apache.hadoop.hive.metastore.api.LockComponent;
 import org.apache.hadoop.hive.metastore.api.LockLevel;
 import org.apache.hadoop.hive.metastore.api.LockRequest;
@@ -55,12 +55,12 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableProperties;
-import org.apache.iceberg.common.DynMethods;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
 import org.apache.iceberg.exceptions.NoSuchIcebergTableException;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.hadoop.ConfigProperties;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
@@ -93,14 +93,6 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
   private static final long HIVE_LOCK_CHECK_MAX_WAIT_MS_DEFAULT = 5 * 1000; // 5 seconds
   private static final int HIVE_ICEBERG_METADATA_REFRESH_MAX_RETRIES_DEFAULT = 2;
   private static final long HIVE_TABLE_LEVEL_LOCK_EVICT_MS_DEFAULT = TimeUnit.MINUTES.toMillis(10);
-  private static final DynMethods.UnboundMethod ALTER_TABLE = DynMethods.builder("alter_table")
-      .impl(IMetaStoreClient.class, "alter_table_with_environmentContext",
-          String.class, String.class, Table.class, EnvironmentContext.class)
-      .impl(IMetaStoreClient.class, "alter_table",
-          String.class, String.class, Table.class, EnvironmentContext.class)
-      .impl(IMetaStoreClient.class, "alter_table",
-          String.class, String.class, Table.class)
-      .build();
   private static final BiMap<String, String> ICEBERG_TO_HMS_TRANSLATION = ImmutableBiMap.of(
       // gc.enabled in Iceberg and external.table.purge in Hive are meant to do the same things but with different names
       GC_ENABLED, "external.table.purge"
@@ -271,29 +263,32 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
       try {
         persistTable(tbl, updateHiveTable);
         commitStatus = CommitStatus.SUCCESS;
-      } catch (Throwable persistFailure) {
+      } catch (org.apache.hadoop.hive.metastore.api.AlreadyExistsException e) {
+        throw new AlreadyExistsException(e, "Table already exists: %s.%s", database, tableName);
+
+      } catch (InvalidObjectException e) {
+        throw new ValidationException(e, "Invalid Hive object for %s.%s", database, tableName);
+
+      } catch (Throwable e) {
+        if (e.getMessage() != null && e.getMessage().contains("Table/View 'HIVE_LOCKS' does not exist")) {
+          throw new RuntimeException("Failed to acquire locks from metastore because the underlying metastore " +
+              "table 'HIVE_LOCKS' does not exist. This can occur when using an embedded metastore which does not " +
+              "support transactions. To fix this use an alternative metastore.", e);
+        }
+
         LOG.error("Cannot tell if commit to {}.{} succeeded, attempting to reconnect and check.",
-            database, tableName, persistFailure);
+            database, tableName, e);
         commitStatus = checkCommitStatus(newMetadataLocation, metadata);
         switch (commitStatus) {
           case SUCCESS:
             break;
           case FAILURE:
-            throw persistFailure;
+            throw e;
           case UNKNOWN:
-            throw new CommitStateUnknownException(persistFailure);
+            throw new CommitStateUnknownException(e);
         }
       }
-    } catch (org.apache.hadoop.hive.metastore.api.AlreadyExistsException e) {
-      throw new AlreadyExistsException("Table already exists: %s.%s", database, tableName);
-
     } catch (TException | UnknownHostException e) {
-      if (e.getMessage() != null && e.getMessage().contains("Table/View 'HIVE_LOCKS' does not exist")) {
-        throw new RuntimeException("Failed to acquire locks from metastore because 'HIVE_LOCKS' doesn't " +
-            "exist, this probably happened when using embedded metastore or doesn't create a " +
-            "transactional meta table. To fix this, use an alternative metastore", e);
-      }
-
       throw new RuntimeException(String.format("Metastore operation failed for %s.%s", database, tableName), e);
 
     } catch (InterruptedException e) {
@@ -309,10 +304,7 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
   void persistTable(Table hmsTable, boolean updateHiveTable) throws TException, InterruptedException {
     if (updateHiveTable) {
       metaClients.run(client -> {
-        EnvironmentContext envContext = new EnvironmentContext(
-            ImmutableMap.of(StatsSetupConst.DO_NOT_UPDATE_STATS, StatsSetupConst.TRUE)
-        );
-        ALTER_TABLE.invoke(client, database, tableName, hmsTable, envContext);
+        MetastoreUtil.alterTable(client, database, tableName, hmsTable);
         return null;
       });
     } else {

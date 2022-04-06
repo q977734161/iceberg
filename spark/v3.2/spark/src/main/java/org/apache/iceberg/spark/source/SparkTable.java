@@ -47,6 +47,7 @@ import org.apache.iceberg.spark.Spark3Util;
 import org.apache.iceberg.spark.SparkFilters;
 import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkSchemaUtil;
+import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.connector.catalog.MetadataColumn;
@@ -76,7 +77,7 @@ public class SparkTable implements org.apache.spark.sql.connector.catalog.Table,
   private static final Logger LOG = LoggerFactory.getLogger(SparkTable.class);
 
   private static final Set<String> RESERVED_PROPERTIES =
-      ImmutableSet.of("provider", "format", "current-snapshot-id", "location", "sort-order");
+      ImmutableSet.of("provider", "format", "current-snapshot-id", "location", "sort-order", "identifier-fields");
   private static final Set<TableCapability> CAPABILITIES = ImmutableSet.of(
       TableCapability.BATCH_READ,
       TableCapability.BATCH_WRITE,
@@ -84,10 +85,16 @@ public class SparkTable implements org.apache.spark.sql.connector.catalog.Table,
       TableCapability.STREAMING_WRITE,
       TableCapability.OVERWRITE_BY_FILTER,
       TableCapability.OVERWRITE_DYNAMIC);
+  private static final Set<TableCapability> CAPABILITIES_WITH_ACCEPT_ANY_SCHEMA =
+      ImmutableSet.<TableCapability>builder()
+          .addAll(CAPABILITIES)
+          .add(TableCapability.ACCEPT_ANY_SCHEMA)
+          .build();
 
   private final Table icebergTable;
   private final Long snapshotId;
   private final boolean refreshEagerly;
+  private final Set<TableCapability> capabilities;
   private StructType lazyTableSchema = null;
   private SparkSession lazySpark = null;
 
@@ -99,6 +106,10 @@ public class SparkTable implements org.apache.spark.sql.connector.catalog.Table,
     this.icebergTable = icebergTable;
     this.snapshotId = snapshotId;
     this.refreshEagerly = refreshEagerly;
+
+    boolean acceptAnySchema = PropertyUtil.propertyAsBoolean(icebergTable.properties(),
+        TableProperties.SPARK_WRITE_ACCEPT_ANY_SCHEMA, TableProperties.SPARK_WRITE_ACCEPT_ANY_SCHEMA_DEFAULT);
+    this.capabilities = acceptAnySchema ? CAPABILITIES_WITH_ACCEPT_ANY_SCHEMA : CAPABILITIES;
   }
 
   private SparkSession sparkSession() {
@@ -153,6 +164,11 @@ public class SparkTable implements org.apache.spark.sql.connector.catalog.Table,
       propsBuilder.put("sort-order", Spark3Util.describe(icebergTable.sortOrder()));
     }
 
+    Set<String> identifierFields = icebergTable.schema().identifierFieldNames();
+    if (!identifierFields.isEmpty()) {
+      propsBuilder.put("identifier-fields", "[" + String.join(",", identifierFields) + "]");
+    }
+
     icebergTable.properties().entrySet().stream()
         .filter(entry -> !RESERVED_PROPERTIES.contains(entry.getKey()))
         .forEach(propsBuilder::put);
@@ -162,7 +178,7 @@ public class SparkTable implements org.apache.spark.sql.connector.catalog.Table,
 
   @Override
   public Set<TableCapability> capabilities() {
-    return CAPABILITIES;
+    return capabilities;
   }
 
   @Override
